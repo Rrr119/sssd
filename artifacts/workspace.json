@@ -1,0 +1,17 @@
+{
+  "root": "/home/dev/feedback/uid30802",
+  "B": "/home/dev/feedback/uid30802",
+  "sha": "0868456a2398fe3724e66c18234953e72a81db9b",
+  "wslDistro": "Ubuntu-26.04",
+  "source": {
+    "owner": "SSSD",
+    "repo": "sssd",
+    "sha": "0868456a2398fe3724e66c18234953e72a81db9b"
+  },
+  "fork": {
+    "owner": "Rrr119",
+    "repo": "sssd",
+    "cloneUrl": "https://github.com/Rrr119/sssd.git"
+  },
+  "at": "2026-11-20T16:04:58.862Z"
+}

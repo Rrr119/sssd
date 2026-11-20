@@ -745,3 +745,125 @@ def test_failover__server_is_resolved_from_etc_hosts_when_dns_is_unavailable(cli
             break
 
     assert result.rc == 0, "User is not found, SSSD did not fail over to the server from /etc/hosts!"
+
+
+@pytest.mark.importance("high")
+@pytest.mark.parametrize("method", ["su", "ssh"])
+@pytest.mark.topology(KnownTopologyGroup.AnyProvider)
+@pytest.mark.preferred_topology(KnownTopology.LDAP)
+def test_failover__offline_login_and_recovery_after_network_outage(
+    client: Client, provider: GenericProvider, method: str
+):
+    """
+    :title: Cached login works during a network outage and SSSD recovers when the network is restored
+    :setup:
+        1. Create user "user-1"
+        2. Enable cache_credentials, krb5_store_password_if_offline and
+           set offline_credentials_expiration to 0
+        3. Start SSSD and login to cache the credentials
+    :steps:
+        1. Block all traffic to the provider and bring SSSD offline
+        2. Check that the domain is offline and the user can still login
+        3. Restore the traffic and bring SSSD online
+        4. Wait until the domain is online and login again
+    :expectedresults:
+        1. SSSD is offline
+        2. Login succeeds with cached credentials
+        3. SSSD reconnects to the provider
+        4. Login succeeds
+    :customerscenario: True
+    """
+    provider.user("user-1").add(password="Secret123")
+    client.sssd.domain["cache_credentials"] = "True"
+    client.sssd.domain["krb5_store_password_if_offline"] = "True"
+    client.sssd.pam["offline_credentials_expiration"] = "0"
+    client.sssd.start()
+
+    assert client.auth.parametrize(method).password("user-1", "Secret123"), "Online login failed!"
+
+    client.firewall.outbound.reject_host(provider)
+    # There might be active connections that are not terminated by creating firewall rule.
+    client.sssd.bring_offline()
+
+    assert client.sssd.default_domain is not None, "Default domain is not set!"
+    status = client.sssctl.domain_status(client.sssd.default_domain, online=True)
+    assert "Offline" in status.stdout, "SSSD is not offline!"
+    assert client.auth.parametrize(method).password(
+        "user-1", "Secret123"
+    ), "Offline login with cached credentials failed!"
+
+    client.firewall.outbound.accept_host(provider)
+    client.sssd.bring_online()
+
+    online = False
+    for _ in range(10):
+        if "Offline" not in client.sssctl.domain_status(client.sssd.default_domain, online=True).stdout:
+            online = True
+            break
+        time.sleep(2)
+    assert online, "SSSD did not come back online after the network was restored!"
+
+    assert client.auth.parametrize(method).password(
+        "user-1", "Secret123"
+    ), "Login failed after the network was restored!"
+
+
+@pytest.mark.importance("high")
+@pytest.mark.topology(KnownTopology.LDAP)
+def test_failover__domain_state_and_cache_are_isolated_between_directories(client: Client, ldap: LDAP):
+    """
+    :title: Offline state and cache are isolated between two directory domains
+    :description:
+        Hybrid cloud setup where users come from two directories served by a
+        single provider stack (LDAP). The on-premise directory is unreachable
+        while the cloud directory is available. Each domain must track its own
+        online/offline state and keep its own cache.
+    :setup:
+        1. Create user "user-1" in the directory
+        2. Point the default domain (on-premise) to an unreachable server
+        3. Import a second domain "cloud" that points to the working directory
+        4. Enable fully qualified names and credential caching on both domains
+        5. Start SSSD
+    :steps:
+        1. Resolve user-1 from the on-premise domain to trigger a connection
+        2. Check the online status of both domains
+        3. Resolve user-1 from the cloud domain
+        4. Check that each domain has its own cache database
+    :expectedresults:
+        1. User is not found in the on-premise domain
+        2. On-premise domain is offline, cloud domain is online
+        3. User is found in the cloud domain
+        4. cache_<on-premise>.ldb and cache_cloud.ldb both exist
+    :customerscenario: True
+    """
+    ldap.user("user-1").add()
+
+    assert client.sssd.default_domain is not None, "Default domain is not set!"
+    onprem = client.sssd.default_domain
+
+    # The on-premise directory is unreachable (network outage).
+    client.sssd.domain["ldap_uri"] = f"ldap://invalid.{ldap.domain}"
+    client.sssd.domain["use_fully_qualified_names"] = "True"
+    client.sssd.domain["cache_credentials"] = "True"
+
+    # The cloud directory uses the same provider stack and is reachable.
+    client.sssd.import_domain("cloud", ldap)
+    client.sssd.dom("cloud")["use_fully_qualified_names"] = "True"
+    client.sssd.dom("cloud")["cache_credentials"] = "True"
+
+    client.sssd.start()
+
+    # Trigger a connection attempt to the on-premise directory.
+    assert client.tools.id(f"user-1@{onprem}") is None, "User was found in the unreachable on-premise domain!"
+
+    status = client.sssctl.domain_status(onprem, online=True)
+    assert "Offline" in status.stdout, "On-premise domain is not offline!"
+
+    status = client.sssctl.domain_status("cloud", online=True)
+    assert "Offline" not in status.stdout, "Cloud domain is not online!"
+    assert client.tools.id("user-1@cloud") is not None, "User was not found in the cloud domain!"
+
+    # Each domain keeps its own cache, entries never leak between directories.
+    databases = client.host.conn.run("ls /var/lib/sss/db").stdout
+    assert f"cache_{onprem}.ldb" in databases.split(), f"cache_{onprem}.ldb does not exist!"
+    assert "cache_cloud.ldb" in databases.split(), "cache_cloud.ldb does not exist!"
